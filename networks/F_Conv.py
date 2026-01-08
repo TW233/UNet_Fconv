@@ -822,3 +822,115 @@ class Fconv_Up(nn.Module):
                 self.register_buffer('bias', _bias)
 
         return super().train(mode)
+
+
+class Fconv_1X1_out(nn.Module):
+    def __init__(self, inNum, outNum, tranNum=4, bias=True, padding=0, padding_mode="zeros"):
+        """
+        修正后的等变 1x1 卷积输出层。
+        通过强制权重在 tranNum 维度上共享，实现旋转不变的特征聚合（输出随空间旋转）。
+        """
+        super(Fconv_1X1_out, self).__init__()
+
+        self.tranNum = tranNum
+        self.outNum = outNum
+        self.inNum = inNum
+        self.padding = padding
+        self.padding_mode = padding_mode
+        self.ifbias = bias
+
+        # 【关键修改】
+        # 权重维度改为 [outNum, inNum, 1, 1]
+        # 这里不包含 tranNum 维度，意味着我们强制让所有方向共享同一个权重 W_i
+        self.weights = nn.Parameter(torch.Tensor(outNum, inNum, 1, 1), requires_grad=True)
+
+        # Bias 设置
+        if bias:
+            self.c = nn.Parameter(torch.zeros(1, outNum, 1, 1), requires_grad=True)
+        else:
+            self.register_parameter('c', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weights, a=math.sqrt(5))
+        if self.c is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weights)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.c, -bound, bound)
+
+    def forward(self, input):
+        # input shape: [Batch, inNum * tranNum, H, W]
+
+        # 1. 准备卷积核
+        if self.training:
+            # 构造共享权重的 Filter
+            # 原始权重: [outNum, inNum, 1, 1]
+            # 扩展目标: [outNum, inNum * tranNum, 1, 1]
+            # 逻辑：对于每一个输出通道，每一个输入特征 i 的所有方向 t，都使用相同的权重
+
+            tempW = self.weights.unsqueeze(2)  # [outNum, inNum, 1, 1, 1]
+            tempW = tempW.repeat(1, 1, self.tranNum, 1, 1)  # [outNum, inNum, tranNum, 1, 1]
+            _filter = tempW.reshape(self.outNum, self.inNum * self.tranNum, 1, 1)
+
+            if self.ifbias:
+                _bias = self.c
+                self.register_buffer("bias", _bias)
+        else:
+            # 评估模式使用缓存
+            _filter = getattr(self, 'filter', None)
+            # 如果是 eval 模式第一次运行且没有缓存（edge case），则现场计算
+            if _filter is None:
+                tempW = self.weights.unsqueeze(2).repeat(1, 1, self.tranNum, 1, 1)
+                _filter = tempW.reshape(self.outNum, self.inNum * self.tranNum, 1, 1)
+
+            if self.ifbias:
+                _bias = getattr(self, 'bias', self.c)
+
+        # 2. 处理 Padding
+        if self.padding_mode == 'zeros':
+            padded_input = input
+            conv_padding = self.padding
+        else:
+            if isinstance(self.padding, int):
+                pad_arg = (self.padding, self.padding, self.padding, self.padding)
+            elif isinstance(self.padding, tuple):
+                pad_arg = (self.padding[1], self.padding[1], self.padding[0], self.padding[0])
+            else:
+                raise ValueError("Padding must be int or tuple")
+
+            padded_input = F.pad(input, pad_arg, mode=self.padding_mode)
+            conv_padding = 0
+
+        # 3. 执行卷积
+        output = F.conv2d(padded_input,
+                          _filter,
+                          padding=conv_padding,
+                          dilation=1,
+                          groups=1)
+
+        # 4. 加上 Bias
+        if self.ifbias:
+            output = output + _bias
+
+        return output
+
+    def train(self, mode=True):
+        if mode:
+            # 切换回训练模式，清除缓存
+            if hasattr(self, "filter"):
+                del self.filter
+                if self.ifbias:
+                    del self.bias
+        elif self.training:
+            # 切换到评估模式，预计算并缓存 Filter
+            # 这样推理时无需重复执行 repeat 和 reshape 操作
+            tempW = self.weights.unsqueeze(2).repeat(1, 1, self.tranNum, 1, 1)
+            _filter = tempW.reshape(self.outNum, self.inNum * self.tranNum, 1, 1)
+            self.register_buffer("filter", _filter)
+
+            if self.ifbias:
+                _bias = self.c
+                self.register_buffer("bias", _bias)
+
+        return super(Fconv_1X1_out, self).train(mode)

@@ -2,21 +2,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # UNet的一大层，包含了两层小的卷积
 class DoubleConv(nn.Module):
-    def __init__(self, in_ch, out_ch, ifIni=0):
+    def __init__(self, in_ch, out_ch, sizeP=3):
         super(DoubleConv, self).__init__()
-        if ifIni == 1:
-            kernel_size = 7
-        else:
-            kernel_size = 5
-        padding = kernel_size // 2
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size, padding=padding),
+            nn.Conv2d(in_ch, out_ch, sizeP, padding=sizeP // 2),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size, padding=padding),
+            nn.Conv2d(out_ch, out_ch, sizeP, padding=sizeP // 2),
             nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True)
         )
@@ -29,7 +23,7 @@ class DoubleConv(nn.Module):
 class InConv(nn.Module):
     def __init__(self, in_ch, out_ch):
         super(InConv, self).__init__()
-        self.conv = DoubleConv(in_ch, out_ch, ifIni=1)
+        self.conv = DoubleConv(in_ch, out_ch)
 
     def forward(self, x):
         x = self.conv(x)
@@ -37,10 +31,11 @@ class InConv(nn.Module):
 
 # 定义encoder中的向下传播，包括一个maxpool和一大层
 class Down(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, sizeP=5, stride=2):
         super(Down, self).__init__()
         self.mpconv = nn.Sequential(
-            nn.MaxPool2d(2),
+            nn.Conv2d(in_ch, in_ch, sizeP, stride, padding=sizeP // 2),
+            # nn.MaxPool2d(2),
             DoubleConv(in_ch, out_ch)
         )
 
