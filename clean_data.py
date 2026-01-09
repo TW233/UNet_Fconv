@@ -33,7 +33,7 @@ def filter_dataset(root_dir):
         # 论文数量 2328 / 2841 ≈ 0.81。
         # 如果只剔除全黑，通常能对齐这个数量。
 
-        if water_pixels > 0 and water_ratio < 1.0:
+        if 0.095 <= water_ratio <= 0.905:
             # 检查对应的 Image 是否存在
             if os.path.exists(os.path.join(images_dir, filename)):
                 valid_files.append(filename)

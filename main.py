@@ -7,121 +7,145 @@ from dataset import WaterDataset
 from engine import ExperimentEngine
 from utils import setup_logger, load_model_class
 
-# ================= 配置 =================
+# === 配置区域 ===
 EXPERIMENTS = [
     {
-        'name': 'Baseline_Standard_Unet',
-        'file_path': 'networks/UNet/unet.py', 
+        'name': 'PreCM_Replication_Round',  # 实验名称
+        'file_path': 'networks/UNet/unet.py',  # 指向你修改后的 3.35M 小模型文件
         'class_name': 'Unet',
-        'batch_size': 4, # 显存允许的话，建议改为 8 或 16
+        'batch_size': 16,  # 模型变小了，Batch Size 可以开大，建议 16 或 32
         'epochs': 150
     }
-    # 你可以在这里添加 PreCM 的配置进行对比
 ]
 
-DATASET_ROOT = './data/Water Bodies Dataset'
-VALID_LIST_FILE = 'valid_images.txt' # 对应第一步生成的文件
+DATASET_ROOT = 'E:/PyCharm/Projects/data/Satellite/Water Bodies Dataset'  # 请确认你的数据路径
+VALID_LIST_FILE = 'valid_images.txt'  # clean_data.py 生成的列表
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-NUM_ROUNDS = 5 # 论文里的“重复5次”
-# =======================================
+NUM_ROUNDS = 5  # 论文要求的 5 轮实验
 
-def run_experiment_round(exp_config, full_dataset, round_idx, train_indices, test_indices, logger):
-    exp_name = f"{exp_config['name']}_Round{round_idx+1}"
-    save_dir = os.path.join('results', exp_config['name'], f'round_{round_idx+1}')
+
+def run_round(exp_config, train_dataset, test_dataset, round_idx, train_indices, test_indices, logger):
+    """
+    执行单轮实验
+    train_dataset: 开启了增强的数据集对象
+    test_dataset: 关闭了增强的数据集对象
+    """
+    exp_name = f"{exp_config['name']}_Round{round_idx + 1}"
+    save_dir = os.path.join('results', exp_config['name'], f'round_{round_idx + 1}')
     os.makedirs(save_dir, exist_ok=True)
-    
-    # 重新初始化 Logger
-    # 注意：为了简单，这里你可以复用 logger 或者创建新的 file handler
-    logger.info(f"--- Starting Round {round_idx+1}/{NUM_ROUNDS} ---")
-    logger.info(f"Train set: {len(train_indices)}, Test set: {len(test_indices)}")
-    
-    # 1. 动态加载模型 (每一轮都要重新初始化，确保权重重置)
-    try:
-        ModelClass = load_model_class(exp_config['file_path'], exp_config['class_name'])
-        model = ModelClass(in_channels=3, classes=2)
-        
-        # 显式初始化 (论文提到 Gaussian initialization)
-        for name, param in model.named_parameters():
-            if 'weight' in name and param.dim() > 1:
-                torch.nn.init.normal_(param, mean=0.0, std=0.02)
-                
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        return None
 
-    # 2. 创建 DataLoader
-    train_subset = Subset(full_dataset, train_indices)
-    test_subset = Subset(full_dataset, test_indices)
-    
-    train_loader = DataLoader(train_subset, batch_size=exp_config['batch_size'], 
-                              shuffle=True, num_workers=4, pin_memory=True)
+    logger.info(f"--- Round {round_idx + 1} Started ---")
+
+    # 1. 动态加载模型
+    ModelClass = load_model_class(exp_config['file_path'], exp_config['class_name'])
+    # 注意：这里初始化的是修改后的 32通道 U-Net
+    model = ModelClass(in_channels=3, classes=2)
+
+    # 2. 权重初始化 (这是复现论文的关键细节)
+    for name, param in model.named_parameters():
+        if 'weight' in name and param.dim() > 1:
+            torch.nn.init.normal_(param, mean=0.0, std=0.02)
+        elif 'bias' in name:
+            torch.nn.init.constant_(param, 0.0)
+
+    # 3. 构建 Subset
+    # 关键点：训练集从“增强版”Dataset取，测试集从“纯净版”Dataset取
+    # 只要 file_list 顺序一致，indices 就是通用的
+    train_subset = Subset(train_dataset, train_indices)
+    test_subset = Subset(test_dataset, test_indices)
+
+    # 4. DataLoader
+    # num_workers 建议设为 4 或 8，加快数据读取
+    train_loader = DataLoader(train_subset, batch_size=exp_config['batch_size'],
+                              shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+
+    # 测试集 batch_size=1 是标准做法
     test_loader = DataLoader(test_subset, batch_size=1, shuffle=False, num_workers=4)
-    
-    # 3. 运行引擎
+
+    # 5. 启动引擎
     engine = ExperimentEngine(model, train_loader, test_loader, DEVICE, save_dir, logger)
-    
+
     # 训练
     engine.train(epochs=exp_config['epochs'])
-    
+
     # 评估
     metrics = engine.evaluate()
-    
-    # 保存这一轮的结果
+
+    # 可选：保存可视化结果
+    # engine.visualize(num_samples=5)
+
     return metrics
 
+
 def main():
-    # 0. 读取清洗后的文件列表
+    # 1. 读取有效图片列表
     if not os.path.exists(VALID_LIST_FILE):
-        print("请先运行 clean_data.py 生成 valid_images.txt")
+        print(f"Error: 找不到 {VALID_LIST_FILE}，请先运行 clean_data.py")
         return
 
     with open(VALID_LIST_FILE, 'r') as f:
         file_list = [line.strip() for line in f.readlines()]
-    
-    print(f"加载了 {len(file_list)} 张有效图片")
-    
-    # 初始化数据集对象
-    full_dataset = WaterDataset(DATASET_ROOT, file_list, img_size=448)
-    
+
+    total_images = len(file_list)
+    print(f"Total Valid Images Loaded: {total_images}")
+
+    # 2. 准备两个 Dataset 对象
+    # train_dataset: is_train=True (开启翻转、旋转增强)
+    # test_dataset:  is_train=False (仅 Resize 和 Normalize)
+    # 假设你已经把图片 resize 改回了 256 (推荐) 或保持 448
+    IMG_SIZE = 256
+
+    train_dataset = WaterDataset(DATASET_ROOT, file_list, img_size=IMG_SIZE, is_train=True)
+    test_dataset = WaterDataset(DATASET_ROOT, file_list, img_size=IMG_SIZE, is_train=False)
+
+    # 3. 论文规定的训练集数量
+    NUM_TRAIN = 1662
+
     for exp_config in EXPERIMENTS:
         logger = setup_logger(os.path.join('results', exp_config['name']))
-        logger.info(f"Start Experiment Group: {exp_config['name']}")
-        
-        round_metrics = {'iou': [], 'rd': []}
-        
+        logger.info(f"Experiment Configuration: {exp_config}")
+
+        round_ious = []
+        round_rds = []
+
         for round_idx in range(NUM_ROUNDS):
-            # === 核心：每一轮重新随机划分 ===
-            # 论文: 70% 训练 (这里我们假设剩余30%测试，或者按论文说的随机抽70%做啥)
-            # 标准做法：Shuffle -> Split
-            total_size = len(file_list)
-            indices = list(range(total_size))
-            random.shuffle(indices) # 随机打乱
-            
-            split = int(np.floor(0.7 * total_size))
-            train_indices = indices[:split]
-            test_indices = indices[split:]
-            
+            # === 每一轮重新随机划分数据集 ===
+            indices = list(range(total_images))
+            random.shuffle(indices)  # 打乱
+
+            train_indices = indices[:NUM_TRAIN]
+            test_indices = indices[NUM_TRAIN:]  # 剩余所有作为测试集
+
+            logger.info(f"Round {round_idx + 1} Split: Train={len(train_indices)}, Test={len(test_indices)}")
+
             # 运行单轮实验
-            metrics = run_experiment_round(exp_config, full_dataset, round_idx, train_indices, test_indices, logger)
-            
+            metrics = run_round(exp_config, train_dataset, test_dataset, round_idx, train_indices, test_indices, logger)
+
             if metrics:
-                # 记录 Baseline (0度) 的 IOU 和 RD (通常关注0度和Random)
-                # 这里记录 0 度 IOU
-                round_metrics['iou'].append(metrics['0']['iou'])
-                round_metrics['rd'].append(metrics['0']['rd'])
-        
-        # 计算 5 轮平均值
-        avg_iou = np.mean(round_metrics['iou'])
-        avg_rd = np.mean(round_metrics['rd'])
-        
-        logger.info(f"============================================")
-        logger.info(f"Experiment {exp_config['name']} Final Result (Avg over 5 rounds):")
-        logger.info(f"Avg IOU (0 deg): {avg_iou:.2f}")
-        logger.info(f"Avg RD (0 deg): {avg_rd:.2f}")
-        logger.info(f"============================================")
+                # 记录核心指标：0度下的 IoU 和 RD
+                iou_0 = metrics['0']['iou']
+                rd_val = metrics['0']['rd']
+
+                round_ious.append(iou_0)
+                round_rds.append(rd_val)
+                logger.info(f"Round {round_idx + 1} Result -> IoU(0): {iou_0:.2f}, RD: {rd_val:.2f}")
+
+        # === 5轮结束后计算平均值 ===
+        avg_iou = np.mean(round_ious)
+        std_iou = np.std(round_ious)
+        avg_rd = np.mean(round_rds)
+
+        logger.info("=" * 40)
+        logger.info(f"FINAL RESULTS ({NUM_ROUNDS} Rounds)")
+        logger.info(f"Avg IoU (0°): {avg_iou:.2f} ± {std_iou:.2f}")
+        logger.info(f"Avg RD: {avg_rd:.2f}")
+        logger.info("=" * 40)
+
 
 if __name__ == '__main__':
-    # 确保随机性可复现，也可以不设
-    random.seed(42)
-    torch.manual_seed(42)
+    # 设置随机种子 (可选，为了完全复现可以固定，但论文建议是随机多次)
+    # seed = 42
+    # torch.manual_seed(seed)
+    # np.random.seed(seed)
+    # random.seed(seed)
     main()
